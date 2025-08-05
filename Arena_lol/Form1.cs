@@ -116,7 +116,7 @@ namespace LoLAutoWinForms
             mainLayout.Controls.Add(grpStatus, 0, 0);
 
             // Auto-Accept
-            chkAutoAccept = new MaterialCheckbox { Text = "Auto acept", Checked = true, Dock = DockStyle.Left, AutoSize = true };
+            chkAutoAccept = new MaterialCheckbox { Text = "Auto accept", Checked = true, Dock = DockStyle.Left, AutoSize = true };
             mainLayout.Controls.Add(chkAutoAccept, 0, 1);
 
             // Champion Selection
