@@ -6,28 +6,23 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
-using System.Net.Security;
-using System.Security.Cryptography.X509Certificates;
 using System.Text;
-using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
-using System.Xml.Linq;
-using System.Net;
-using System.Reflection;
 using Arena_lol.Properties;
 
 namespace LoLAutoWinForms
 {
     public partial class Form1 : MaterialForm
     {
-        // Mapa de campeones y colas
         private readonly Dictionary<string, int> CHAMPION_IDS = new Dictionary<string, int>
         {
             {"Swain", 50}, {"Tryndamere", 23}
         };
+
         private readonly Dictionary<int, string> QUEUE_TYPES = new Dictionary<int, string>
         {
             {420, "Ranked Solo/Duo"},
@@ -44,25 +39,24 @@ namespace LoLAutoWinForms
             {1130, "Teamfight Tactics Ranked"}
         };
 
-        // Controles UI
         private Label lblQueueStatus, lblGameMode, lblConnection;
         private CheckBox chkAutoAccept;
         private TextBox txtLog;
         private System.Windows.Forms.Timer pollTimer;
-
-        // HTTP & autenticación
         private HttpClient httpClient;
         private string baseUrl, authHeader;
         private bool isRunning = false;
         private string selectedChampion = null;
-
         private Button btnStartDeceive;
         private string deceiveExePath = null;
+        private int reconnectAttempts = 0;
+        private const int MaxReconnectAttempts = 5;
+        private bool isReconnecting = false;
 
         public Form1()
         {
             this.Icon = Resources.app;
-            // Inicializa el tema MaterialSkin
+
             var materialSkinManager = MaterialSkinManager.Instance;
             materialSkinManager.AddFormToManage(this);
             materialSkinManager.Theme = MaterialSkinManager.Themes.DARK;
@@ -72,14 +66,11 @@ namespace LoLAutoWinForms
 
             Text = "LoL Auto-Ban & Accept";
             Width = 500; Height = 700;
+
             InitUI();
             DetectOrShowDeceiveButton();
 
-            // Intentar conectar automáticamente al cliente al abrir la app
-            Shown += async (s, e) =>
-            {
-                await ConnectToClient();
-            };
+            Shown += async (s, e) => { await ConnectToClient(); };
         }
 
         private void InitUI()
@@ -91,21 +82,24 @@ namespace LoLAutoWinForms
                 RowCount = 5,
                 ColumnCount = 1,
                 Padding = new Padding(10),
-                BackColor = System.Drawing.Color.FromArgb(38, 50, 56), // Fondo oscuro
-                RowStyles =
-        {
-            new RowStyle(SizeType.Absolute, 100),
-            new RowStyle(SizeType.Absolute, 40),
-            new RowStyle(SizeType.Absolute, 80),
-            new RowStyle(SizeType.Absolute, 50),
-            new RowStyle(SizeType.Percent, 100)
-        }
+                BackColor = System.Drawing.Color.FromArgb(38, 50, 56),
             };
+            mainLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 100));
+            mainLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
+            mainLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 80));
+            mainLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 50));
+            mainLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
             Controls.Add(mainLayout);
 
             // Status GroupBox
             var grpStatus = new MaterialCard { Dock = DockStyle.Fill, Padding = new Padding(10) };
-            var statusLayout = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 1, ColumnCount = 3, BackColor = System.Drawing.Color.Transparent };
+            var statusLayout = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                RowCount = 1,
+                ColumnCount = 3,
+                BackColor = System.Drawing.Color.Transparent
+            };
             lblQueueStatus = new MaterialLabel { Text = "No conectado", ForeColor = System.Drawing.Color.OrangeRed, TextAlign = System.Drawing.ContentAlignment.MiddleCenter, Dock = DockStyle.Fill };
             lblGameMode = new MaterialLabel { Text = "Desconocido", TextAlign = System.Drawing.ContentAlignment.MiddleCenter, Dock = DockStyle.Fill };
             lblConnection = new MaterialLabel { Text = "✗ Desconectado", ForeColor = System.Drawing.Color.OrangeRed, TextAlign = System.Drawing.ContentAlignment.MiddleCenter, Dock = DockStyle.Fill };
@@ -116,7 +110,13 @@ namespace LoLAutoWinForms
             mainLayout.Controls.Add(grpStatus, 0, 0);
 
             // Auto-Accept
-            chkAutoAccept = new MaterialCheckbox { Text = "Auto accept", Checked = true, Dock = DockStyle.Left, AutoSize = true };
+            chkAutoAccept = new MaterialCheckbox
+            {
+                Text = "Auto accept",
+                Checked = true,
+                Dock = DockStyle.Left,
+                AutoSize = true
+            };
             mainLayout.Controls.Add(chkAutoAccept, 0, 1);
 
             // Champion Selection
@@ -135,17 +135,51 @@ namespace LoLAutoWinForms
             grpBan.Controls.Add(banLayout);
             mainLayout.Controls.Add(grpBan, 0, 2);
 
-            // Botón para iniciar/reiniciar Deceive
-            var pnlButtons = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.LeftToRight, BackColor = System.Drawing.Color.Transparent };
+            // Botones
+            var pnlButtons = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                FlowDirection = FlowDirection.LeftToRight,
+                BackColor = System.Drawing.Color.Transparent
+            };
             btnStartDeceive = new MaterialButton
             {
                 Text = "Iniciar Deceive",
                 Width = 200,
                 Visible = true
             };
-            btnStartDeceive.Click += async (s, e) => await StartDeceive();
             pnlButtons.Controls.Add(btnStartDeceive);
+
+            var btnClearLog = new MaterialButton
+            {
+                Text = "Limpiar Log",
+                Width = 120,
+                Dock = DockStyle.Right
+            };
+            btnClearLog.Click += (s, e) => ClearLog();
+            pnlButtons.Controls.Add(btnClearLog);
             mainLayout.Controls.Add(pnlButtons, 0, 3);
+
+            // Evento botón "Iniciar/Reiniciar LoL"
+            btnStartDeceive.Click += async (s, e) =>
+            {
+                if (IsLeagueClientRunning())
+                {
+                    Log("Cerrando League of Legends...");
+                    foreach (var p in Process.GetProcessesByName("LeagueClientUx"))
+                    {
+                        try { p.Kill(); } catch { }
+                    }
+                    await Task.Delay(2000);
+
+                    Log("Reiniciando LoL...");
+                    await StartDeceive();
+                }
+                else
+                {
+                    await StartDeceive();
+                }
+            };
 
             // Log
             txtLog = new TextBox
@@ -159,11 +193,10 @@ namespace LoLAutoWinForms
             };
             mainLayout.Controls.Add(txtLog, 0, 4);
 
-            // Timer para polling
+            // Timer
             pollTimer = new System.Windows.Forms.Timer { Interval = 1000 };
             pollTimer.Tick += async (s, e) => await PollStatusAndAct();
 
-            // Inicia la automatización siempre
             isRunning = true;
             pollTimer.Start();
         }
@@ -173,37 +206,38 @@ namespace LoLAutoWinForms
             txtLog.AppendText($"[{DateTime.Now:HH:mm:ss}] {msg}{Environment.NewLine}");
         }
 
+        private void ClearLog()
+        {
+            txtLog.Clear();
+        }
+
         private async Task<bool> ConnectToClient()
         {
             try
             {
-                // 1) Leer lockfile
-                int port;
-                string token;
+                int port; string token;
                 FindAndReadLockfile(out port, out token);
                 baseUrl = $"https://127.0.0.1:{port}";
                 authHeader = Convert.ToBase64String(Encoding.UTF8.GetBytes($"riot:{token}"));
 
-
-                // 2) Crear HttpClient ignorando SSL
                 var handler = new HttpClientHandler
                 {
-                    ServerCertificateCustomValidationCallback = (HttpRequestMessage req, X509Certificate2 cert,
-                        X509Chain chain, SslPolicyErrors errors) => true
+                    ServerCertificateCustomValidationCallback = (req, cert, chain, errors) => true
                 };
                 httpClient = new HttpClient(handler);
                 httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Basic", authHeader);
                 httpClient.Timeout = TimeSpan.FromSeconds(3);
 
-                Log("Connected to League Client");
-                UpdateStatus("Connected", "Ready", "✓ Connected");
-                //btnStartDeceive.Visible = false;
+                Log("Conectado al cliente de League of Legends.");
+                UpdateStatus("Conectado", "Listo", "✓ Conectado");
+                reconnectAttempts = 0;
+                isReconnecting = false;
                 return true;
             }
             catch (Exception ex)
             {
-                Log($"Connection error: {ex.Message}");
-                UpdateStatus("Connection Error", "Unknown", "✗ Disconnected");
+                Log($"Error de conexión: {ex.Message}");
+                UpdateStatus("Error de conexión", "Desconocido", "✗ Desconectado");
                 DetectOrShowDeceiveButton();
                 return false;
             }
@@ -214,34 +248,29 @@ namespace LoLAutoWinForms
             lblQueueStatus.Text = queue;
             lblGameMode.Text = mode;
             lblConnection.Text = conn;
+            lblConnection.ForeColor = conn.Contains("✓") ? System.Drawing.Color.LightGreen : System.Drawing.Color.OrangeRed;
         }
 
         private void FindAndReadLockfile(out int port, out string token)
         {
             var proc = Process.GetProcessesByName("LeagueClientUx").FirstOrDefault()
                        ?? throw new Exception("LeagueClientUx.exe no está en ejecución");
-
             string dir = Path.GetDirectoryName(proc.MainModule.FileName);
             string lockfile = Path.Combine(dir, "lockfile");
             if (!File.Exists(lockfile))
                 throw new Exception("lockfile no encontrado en " + dir);
 
             string content;
-            // Lee el archivo permitiendo acceso compartido
             using (var fs = new FileStream(lockfile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
             using (var reader = new StreamReader(fs))
-            {
                 content = reader.ReadToEnd();
-            }
 
             var parts = content.Split(':');
             if (parts.Length < 5)
                 throw new Exception("Formato inesperado de lockfile");
-
             port = int.Parse(parts[2]);
             token = parts[3];
         }
-
 
         private async Task<string> GetAsync(string path)
         {
@@ -268,7 +297,21 @@ namespace LoLAutoWinForms
 
             try
             {
-                // 1) Estado de matchmaking
+                // Esperar si LoL no está abierto
+                if (!IsLeagueClientRunning())
+                {
+                    UpdateStatus("Esperando LoL", "Cliente no iniciado", "✗ Desconectado");
+                    while (!IsLeagueClientRunning())
+                    {
+                        await Task.Delay(2000);
+                        Application.DoEvents();
+                    }
+                    Log("League of Legends detectado, reconectando...");
+                    await ConnectToClient();
+                    return;
+                }
+
+                // Estado de matchmaking
                 var search = await GetAsync("/lol-matchmaking/v1/search");
                 if (search != null)
                 {
@@ -277,24 +320,24 @@ namespace LoLAutoWinForms
                     {
                         int qid = job["queueId"].Value<int>();
                         int tInQ = job["timeInQueue"].Value<int>();
-                        UpdateStatus($"In Queue ({tInQ}s)", QUEUE_TYPES.ContainsKey(qid) ? QUEUE_TYPES[qid] : $"Unknown ({qid})", "✓ Connected");
+                        UpdateStatus($"En cola ({tInQ}s)", QUEUE_TYPES.ContainsKey(qid) ? QUEUE_TYPES[qid] : $"Desconocida ({qid})", "✓ Conectado");
                     }
                 }
 
-                // 2) Ready‐check + auto‐accept
+                // Ready check auto-accept
                 var rc = await GetAsync("/lol-matchmaking/v1/ready-check");
                 if (rc != null && JObject.Parse(rc)["state"]?.ToString() == "InProgress")
                 {
-                    UpdateStatus("Ready Check", "Match Found", "✓ Connected");
+                    UpdateStatus("Ready Check", "Match Found", "✓ Conectado");
                     if (chkAutoAccept.Checked)
                     {
-                        Log("Ready-check detected. Accepting...");
+                        Log("Ready-check detectado. Aceptando...");
                         await PostAsync("/lol-matchmaking/v1/ready-check/accept");
-                        Log("✓ Ready-check accepted!");
+                        Log("✓ Match aceptado!");
                     }
                 }
 
-                // 3) Auto-ban
+                // Auto-ban
                 if (!string.IsNullOrEmpty(selectedChampion))
                 {
                     var sess = await GetAsync("/lol-champ-select/v1/session");
@@ -311,11 +354,11 @@ namespace LoLAutoWinForms
                                     && act["type"].ToString() == "ban"
                                     && act["isInProgress"].Value<bool>())
                                 {
-                                    Log($"Banning {selectedChampion}...");
+                                    Log($"Baneando {selectedChampion}...");
                                     int actionId = act["id"].Value<int>();
                                     var payload = new JObject { ["championId"] = banId, ["completed"] = true };
                                     if (await PatchAsync($"/lol-champ-select/v1/session/actions/{actionId}", payload.ToString()))
-                                        Log($"✓ {selectedChampion} banned successfully!");
+                                        Log($"✓ {selectedChampion} baneado correctamente!");
                                 }
                             }
                         }
@@ -324,86 +367,32 @@ namespace LoLAutoWinForms
             }
             catch (Exception ex)
             {
-                Log($"Error in automation: {ex.Message}");
-                UpdateStatus("Error", "Unknown", "✗ Disconnected");
+                Log($"Error en la automatización: {ex.Message}");
+                UpdateStatus("Error", "Desconocido", "✗ Desconectado");
             }
-        }
-
-        private async Task StartAutomation()
-        {
-            if (string.IsNullOrEmpty(selectedChampion))
-            {
-                MessageBox.Show("Por favor selecciona un campeón para banear.", "Warning", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                return;
-            }
-
-
-            if (!await ConnectToClient())
-            {
-                return;
-            }
-
-            isRunning = true;
-            pollTimer.Start();
-            Log("Automation started!");
-        }
-
-        private void StopAutomation()
-        {
-            isRunning = false;
-            pollTimer.Stop();
-            UpdateStatus("Not Connected", "Idle", "✗ Disconnected");
-            Log("Automation stopped!");
         }
 
         private void DetectOrShowDeceiveButton()
         {
-            // El botón siempre es visible
             btnStartDeceive.Visible = true;
-
-            if (IsLeagueClientRunning())
-            {
-                btnStartDeceive.Text = "Reiniciar LoL";
-            }
-            else
-            {
-                btnStartDeceive.Text = "Iniciar LoL";
-                // Si no se ha encontrado la ruta, buscar o descargar
-                Task.Run(async () =>
-                {
-                    deceiveExePath = await FindDeceiveExe();
-                    if (deceiveExePath == null)
-                    {
-                        deceiveExePath = await DownloadDeceiveExe();
-                    }
-                });
-            }
+            btnStartDeceive.Text = IsLeagueClientRunning() ? "Reiniciar LoL" : "Iniciar LoL";
         }
 
-        private bool IsLeagueClientRunning()
-        {
-            return Process.GetProcessesByName("LeagueClientUx").Any();
-        }
+        private bool IsLeagueClientRunning() =>
+            Process.GetProcessesByName("LeagueClientUx").Any();
 
         private async Task<string> FindDeceiveExe()
         {
             string userFolder = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-            string[] searchFolders = new[]
-            {
-                userFolder,
-                Path.Combine(userFolder, "Downloads"),
-                Path.Combine(userFolder, "Desktop")
-            };
-
+            string[] searchFolders = { userFolder, Path.Combine(userFolder, "Downloads"), Path.Combine(userFolder, "Desktop") };
             foreach (var folder in searchFolders)
             {
                 try
                 {
                     var files = Directory.GetFiles(folder, "Deceive.exe", SearchOption.TopDirectoryOnly);
-                    if (files.Length > 0)
-                        return files[0];
+                    if (files.Length > 0) return files[0];
                 }
-                catch { /* Ignorar carpetas inaccesibles */ }
+                catch { }
             }
             return null;
         }
@@ -432,11 +421,15 @@ namespace LoLAutoWinForms
         {
             if (string.IsNullOrEmpty(deceiveExePath) || !File.Exists(deceiveExePath))
             {
-                deceiveExePath = await DownloadDeceiveExe();
-                if (deceiveExePath == null)
+                deceiveExePath = await FindDeceiveExe();
+                if (string.IsNullOrEmpty(deceiveExePath) || !File.Exists(deceiveExePath))
                 {
-                    MessageBox.Show("No se pudo encontrar ni descargar Deceive.exe.", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                    return;
+                    deceiveExePath = await DownloadDeceiveExe();
+                    if (deceiveExePath == null)
+                    {
+                        MessageBox.Show("No se pudo encontrar ni descargar Deceive.exe.", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                        return;
+                    }
                 }
             }
 
@@ -444,7 +437,6 @@ namespace LoLAutoWinForms
             {
                 Process.Start(deceiveExePath);
                 Log("Deceive.exe iniciado. Esperando al cliente de LoL...");
-                // Espera unos segundos y vuelve a comprobar
                 await Task.Delay(5000);
                 DetectOrShowDeceiveButton();
             }
@@ -452,6 +444,11 @@ namespace LoLAutoWinForms
             {
                 MessageBox.Show("Error al iniciar Deceive.exe: " + ex.Message, "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
+        }
+
+        // Método vacío para evitar error CS1061
+        private void Form1_Load(object sender, EventArgs e)
+        {
         }
     }
 }
